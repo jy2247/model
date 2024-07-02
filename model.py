@@ -38,19 +38,18 @@ class ModelArgs:
 layer_num = 0
 layer_num_need = (0, 31)
 inference_mode = "decoding"  # "decoding" or "prefill"
-save_path = "./data_for_z4"
+save_path = "./data_for_gem5_v2"
 
 
 class SaveData():
     def __init__(self):
         self.description_dict = {}
-        #self.data_dict = {}
+        self.data_dict = {}
         self.shape_dict = {}
         self.shape_description_dict = {}
         self.source_code_dict = {}
         self.stride_dict = {}
         self.name_list = []
-        self.save_path = "./data_for_z4"
 
     def add_data(self, name: str, data: torch.tensor, shape_description: str, source_code: str, description: str):
         if 0 <= layer_num <= 31 and layer_num not in layer_num_need:
@@ -59,28 +58,29 @@ class SaveData():
             name += ("_" + inference_mode)
         if name.startswith("KVCache") and inference_mode == "prefill":
             return None
-        if name in self.name_list:
+        if name in self.data_dict:
             return None
-
         self.name_list.append(name)
-        #self.data_dict[name] = data.to("cpu")
+        self.data_dict[name] = data.to("cpu")
         self.description_dict[name] = description
         self.shape_dict[name] = str(tuple(data.shape))
         self.shape_description_dict[name] = shape_description
         self.source_code_dict[name] = source_code
         self.stride_dict[name] = str(data.stride())
-
         if not data.is_contiguous():
             print("not contiguous: ", name)
             print(shape_description)
             print(tuple(data.shape))
             print(data.stride())
-            data = data.contiguous()
-        
-        self.save_to_c_file(name, data)
+            self.data_dict[name] = self.data_dict[name].contiguous()
         return None
 
-    def save_to_c_file(self, name: str, data: torch.tensor):
+    def get_data_by_name(self, name: str):
+        if not name.startswith("weight"):
+            name += ("_" + inference_mode)
+        return self.data_dict[name]
+
+    def save_to_c_file(self, name: str):
         path = save_path
         if not os.path.exists(path):
             os.makedirs(path)
@@ -89,7 +89,7 @@ class SaveData():
         shape = self.shape_dict[name]
         source_code = self.source_code_dict[name]
         stride = self.stride_dict[name]
-        #data = self.data_dict[name]
+        data = self.data_dict[name]
         data_size = torch.numel(data)
         # special case
         if name.startswith("activation_token_embedding_tokens"):
@@ -115,18 +115,18 @@ unsigned int {name}[{data_size}] = {{
             with open(f"{path}/{name}_uint32.c", "w") as f:
                 f.write(c_format)
             if not os.path.exists(f"{path}/{name}_uint32.dat"):
-                #data = self.data_dict[name]
+                data = self.data_dict[name]
                 data = data.view(-1, 16).numpy().astype(np.uint32)
                 data.tofile(f"{path}/{name}_uint32.dat")
             return None
         if True:
-            # save data to c file bf16
-            if not os.path.exists(f"{path}/{name}_bf16.c"):
-                data_bf16 = data.view(-1, 16).to(torch.bfloat16)
-                data_bf16 = data_bf16.numpy().view(np.uint16)
-                data_bf16 = np.char.mod("%#06x", data_bf16)
-                data_bf16 = ", \n".join([", ".join(row) for row in data_bf16])
-                c_format_bf16 = f"""
+            # save data to c file fp16
+            if not os.path.exists(f"{path}/{name}_fp16.c"):
+                data_fp16 = data.view(-1, 16).to(torch.float16)
+                data_fp16 = data_fp16.numpy().view(np.uint16)
+                data_fp16 = np.char.mod("%#06x", data_fp16)
+                data_fp16 = ", \n".join([", ".join(row) for row in data_fp16])
+                c_format_fp16 = f"""
 /*
  * Description:         {description}
  * Shape Description:   {shape_description}
@@ -134,24 +134,67 @@ unsigned int {name}[{data_size}] = {{
  * Stride:              {stride}
  * Source Code:         {source_code}
  */
-int {name}_bf16_shape[4] = {{{", ".join([str(x) for x in data.shape])}}};
-unsigned short int {name}_bf16[{data_size}] = {{
-{data_bf16}
+int {name}_fp16_shape[4] = {{{", ".join([str(x) for x in data.shape])}}};
+unsigned short int {name}_fp16[{data_size}] = {{
+{data_fp16}
 }};
 """
-                with open(f"{path}/{name}_bf16.c", "w") as f:
-                    f.write(c_format_bf16)
-            if not os.path.exists(f"{path}/{name}_bf16.dat"):
-                data_bf16_dat = data.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_dat.tofile(f"{path}/{name}_bf16.dat")
-
-            # save data to c file blockwise bf16
-            if not os.path.exists(f"{path}/{name}_bf16_blockwise.c"):
+                with open(f"{path}/{name}_fp16.c", "w") as f:
+                    f.write(c_format_fp16)
+            if not os.path.exists(f"{path}/{name}_fp16.dat"):
+                data_fp16_dat = data.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_dat.tofile(f"{path}/{name}_fp16.dat")
+            # save data to c file fp32
+            if not os.path.exists(f"{path}/{name}_fp32.c"):
+                data_fp32 = data.view(-1, 16).to(torch.float32)
+                data_fp32 = data_fp32.numpy().view(np.uint32)
+                data_fp32 = np.char.mod("%#010x", data_fp32)
+                data_fp32 = ", \n".join([", ".join(row) for row in data_fp32])
+                c_format_fp32 = f"""
+/*
+ * Description:         {description}
+ * Shape Description:   {shape_description}
+ * Shape:               {shape}
+ * Stride:              {stride}
+ * Source Code:         {source_code}
+ */
+int {name}_fp32_shape[4] = {{{", ".join([str(x) for x in data.shape])}}};
+unsigned int {name}_fp32[{data_size}] = {{
+{data_fp32}
+}};
+"""
+                with open(f"{path}/{name}_fp32.c", "w") as f:
+                    f.write(c_format_fp32)
+        # save data to c file blockwise
+        blockwise_size = 32 * 32
+        if len(data.shape) >= 2:
+            x, y = data.shape[-2:]
+            padding_right = y % 32
+            padding_right = 0 if padding_right == 0 else 32 - padding_right
+            padding_bottom = x % 32
+            padding_bottom = 0 if padding_bottom == 0 else 32 - padding_bottom
+            data_blockwise = F.pad(data, (0, padding_right, 0, padding_bottom), mode='constant', value=0)
+            data_blockwise_shape = data.shape[:-2] + (
+            data_blockwise.shape[-2] // 32, 32, data_blockwise.shape[-1] // 32, 32)
+            data_blockwise = data_blockwise.view(*data_blockwise_shape)
+            # 把形状改为data.shape[:-2] + (data_blockwise.shape[-2] // 32, data_blockwise.shape[-1] // 32, 32, 32)
+            data_blockwise = data_blockwise.transpose(-3, -2).contiguous()
+            data_blockwise = data_blockwise.view(*data_blockwise.shape[:-2], 32 * 32)
+            shape_blockwise = str(tuple(data_blockwise.shape))
+            stride_blockwise = str(data_blockwise.stride())
+            shape_description_blockwise = [s.strip() for s in self.shape_description_dict[name].split(",")]
+            shape_description_blockwise[-2] = f"ceil({shape_description_blockwise[-2]} // 32)"
+            shape_description_blockwise[-1] = f"ceil({shape_description_blockwise[-1]} // 32)"
+            shape_description_blockwise.append("32 * 32")
+            shape_description_blockwise = ", ".join(shape_description_blockwise)
+            shape_description_blockwise = f"({shape_description_blockwise})"
+            # save data to c file blockwise fp16
+            if not os.path.exists(f"{path}/{name}_fp16_blockwise.c"):
                 data_size_blockwise = torch.numel(data_blockwise)
-                data_bf16_blockwise = data_blockwise.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_blockwise = np.char.mod("%#06x", data_bf16_blockwise)
-                data_bf16_blockwise = ", \n".join([", ".join(row) for row in data_bf16_blockwise])
-                c_format_bf16_blockwise = f"""
+                data_fp16_blockwise = data_blockwise.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_blockwise = np.char.mod("%#06x", data_fp16_blockwise)
+                data_fp16_blockwise = ", \n".join([", ".join(row) for row in data_fp16_blockwise])
+                c_format_fp16_blockwise = f"""
 /*
  * Description:         {description}
  * Shape Description:   {shape_description_blockwise}
@@ -159,25 +202,56 @@ unsigned short int {name}_bf16[{data_size}] = {{
  * Stride:              {stride_blockwise}
  * Source Code:         {source_code}
  */
-int {name}_bf16_blockwise_shape[5] = {{{", ".join([str(x) for x in data_blockwise.shape])}}};
-unsigned short int {name}_bf16_blockwise[{data_size_blockwise}] = {{
-{data_bf16_blockwise}
+int {name}_fp16_blockwise_shape[5] = {{{", ".join([str(x) for x in data_blockwise.shape])}}};
+unsigned short int {name}_fp16_blockwise[{data_size_blockwise}] = {{
+{data_fp16_blockwise}
 }};
 """
-                with open(f"{path}/{name}_bf16_blockwise.c", "w") as f:
-                    f.write(c_format_bf16_blockwise)
-            # save data to dat file blockwise bf16 bin
-            if not os.path.exists(f"{path}/{name}_bf16_blockwise.dat"):
-                data_bf16_blockwise = data_blockwise.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_blockwise.tofile(f"{path}/{name}_bf16_blockwise.dat")
-
-            # save data to c file blockwise bf16
-            if not os.path.exists(f"{path}/{name}_bf16_blockwise_T.c"):
+                with open(f"{path}/{name}_fp16_blockwise.c", "w") as f:
+                    f.write(c_format_fp16_blockwise)
+            # save data to dat file blockwise fp16 bin
+            if not os.path.exists(f"{path}/{name}_fp16_blockwise.dat"):
+                data_fp16_blockwise = data_blockwise.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_blockwise.tofile(f"{path}/{name}_fp16_blockwise.dat")
+            # save data to c file blockwise fp32
+            if not os.path.exists(f"{path}/{name}_fp32_blockwise.c"):
+                data_size_blockwise = torch.numel(data_blockwise)
+                data_fp32_blockwise = data_blockwise.view(-1, 16).to(torch.float32).numpy().view(np.uint32)
+                data_fp32_blockwise = np.char.mod("%#010x", data_fp32_blockwise)
+                data_fp32_blockwise = ", \n".join([", ".join(row) for row in data_fp32_blockwise])
+                c_format_fp32_blockwise = f"""
+/*
+ * Description:         {description}
+ * Shape Description:   {shape_description_blockwise}
+ * Shape:               {shape_blockwise}
+ * Stride:              {stride_blockwise}
+ * Source Code:         {source_code}
+ */
+int {name}_fp32_blockwise_shape[5] = {{{", ".join([str(x) for x in data_blockwise.shape])}}};
+unsigned int {name}_fp32_blockwise[{data_size_blockwise}] = {{
+{data_fp32_blockwise}
+}};
+"""
+                with open(f"{path}/{name}_fp32_blockwise.c", "w") as f:
+                    f.write(c_format_fp32_blockwise)
+        if name.startswith("weight_attention_w"):
+            data_blockwise_T = data_blockwise.transpose(0, 1).contiguous()
+            shape_blockwise_T = str(tuple(data_blockwise_T.shape))
+            stride_blockwise_T = str(data_blockwise_T.stride())
+            shape_description_blockwise = [s.strip() for s in self.shape_description_dict[name].split(",")]
+            shape_description_blockwise_T = []
+            shape_description_blockwise_T.append(f"ceil({shape_description_blockwise[-1]} // 32)")
+            shape_description_blockwise_T.append(f"ceil({shape_description_blockwise[-2]} // 32)")
+            shape_description_blockwise_T.append("32 * 32")
+            shape_description_blockwise_T = ", ".join(shape_description_blockwise_T)
+            shape_description_blockwise_T = f"({shape_description_blockwise_T})"
+            # save data to c file blockwise fp16
+            if not os.path.exists(f"{path}/{name}_fp16_blockwise_T.c"):
                 data_size_blockwise_T = torch.numel(data_blockwise_T)
-                data_bf16_blockwise_T = data_blockwise_T.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_blockwise_T = np.char.mod("%#06x", data_bf16_blockwise_T)
-                data_bf16_blockwise_T = ", \n".join([", ".join(row) for row in data_bf16_blockwise_T])
-                c_format_bf16_blockwise_T = f"""
+                data_fp16_blockwise_T = data_blockwise_T.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_blockwise_T = np.char.mod("%#06x", data_fp16_blockwise_T)
+                data_fp16_blockwise_T = ", \n".join([", ".join(row) for row in data_fp16_blockwise_T])
+                c_format_fp16_blockwise_T = f"""
 /*
  * Description:         {description}
  * Shape Description:   {shape_description_blockwise_T}
@@ -185,25 +259,64 @@ unsigned short int {name}_bf16_blockwise[{data_size_blockwise}] = {{
  * Stride:              {stride_blockwise_T}
  * Source Code:         {source_code}
  */
-int {name}_bf16_blockwise_T_shape[5] = {{{", ".join([str(x) for x in data_blockwise_T.shape])}}};
-unsigned short int {name}_bf16_blockwise_T[{data_size_blockwise_T}] = {{
-{data_bf16_blockwise_T}
+int {name}_fp16_blockwise_T_shape[5] = {{{", ".join([str(x) for x in data_blockwise_T.shape])}}};
+unsigned short int {name}_fp16_blockwise_T[{data_size_blockwise_T}] = {{
+{data_fp16_blockwise_T}
 }};
 """
-                with open(f"{path}/{name}_bf16_blockwise_T.c", "w") as f:
-                    f.write(c_format_bf16_blockwise_T)
-            # save data to dat file blockwise bf16 bin
-            if not os.path.exists(f"{path}/{name}_bf16_blockwise_T.dat"):
-                data_bf16_blockwise_T = data_blockwise_T.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_blockwise_T.tofile(f"{path}/{name}_bf16_blockwise_T.dat")
-            
-            # save data to c file blockwise bf16
-            if not os.path.exists(f"{path}/{name}_bf16_blockwise_batching.c"):
+                with open(f"{path}/{name}_fp16_blockwise_T.c", "w") as f:
+                    f.write(c_format_fp16_blockwise_T)
+            # save data to dat file blockwise fp16 bin
+            if not os.path.exists(f"{path}/{name}_fp16_blockwise_T.dat"):
+                data_fp16_blockwise_T = data_blockwise_T.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_blockwise_T.tofile(f"{path}/{name}_fp16_blockwise_T.dat")
+            # save data to c file blockwise fp32
+            if not os.path.exists(f"{path}/{name}_fp32_blockwise_T.c"):
+                data_size_blockwise_T = torch.numel(data_blockwise_T)
+                data_fp32_blockwise_T = data_blockwise_T.view(-1, 16).to(torch.float32).numpy().view(np.uint32)
+                data_fp32_blockwise_T = np.char.mod("%#010x", data_fp32_blockwise_T)
+                data_fp32_blockwise_T = ", \n".join([", ".join(row) for row in data_fp32_blockwise_T])
+                c_format_fp32_blockwise_T = f"""
+/*
+ * Description:         {description}
+ * Shape Description:   {shape_description_blockwise_T}
+ * Shape:               {shape_blockwise_T}
+ * Stride:              {stride_blockwise_T}
+ * Source Code:         {source_code}
+ */
+int {name}_fp32_blockwise_T_shape[5] = {{{", ".join([str(x) for x in data_blockwise_T.shape])}}};
+unsigned int {name}_fp32_blockwise_T[{data_size_blockwise_T}] = {{
+{data_fp32_blockwise_T}
+}};
+"""
+                with open(f"{path}/{name}_fp32_blockwise_T.c", "w") as f:
+                    f.write(c_format_fp32_blockwise_T)
+        if (((name.startswith("activation_ffn") and not name.startswith("activation_ffn_norm"))
+                or re.search("activation_attention_x._before_reshape", name)
+                or name.startswith("activation_attention_input") or name.startswith("activation_attention_output_after")
+                or (name.startswith("activation_ffn") and torch.numel(data) >= 32 * 128)
+                or name.startswith("activation_transformerblock_output"))
+                and name.endswith("decoding") and data.shape[-2] == 1):
+            data_blockwise_batching_shape = data.shape[:-3] + (
+                data.shape[-3] // 32, 32, 1, data.shape[-1] // 32, 32)
+            data_blockwise_batching = data.view(*data_blockwise_batching_shape)
+            data_blockwise_batching = data_blockwise_batching.transpose(-4, -3).transpose(-3, -2).contiguous()
+            data_blockwise_batching = data_blockwise_batching.view(*data_blockwise_batching.shape[:-2], 32 * 32)
+            shape_blockwise_batching = str(tuple(data_blockwise_batching.shape))
+            stride_blockwise_batching = str(data_blockwise_batching.stride())
+            shape_description_blockwise_batching = [s.strip() for s in self.shape_description_dict[name].split(",")]
+            shape_description_blockwise_batching[-3] = f"ceil({shape_description_blockwise_batching[-3]} // 32)"
+            shape_description_blockwise_batching[-1] = f"ceil({shape_description_blockwise_batching[-1]} // 32)"
+            shape_description_blockwise_batching.append("32 * 32")
+            shape_description_blockwise_batching = ", ".join(shape_description_blockwise_batching)
+            shape_description_blockwise_batching = f"({shape_description_blockwise_batching})"
+            # save data to c file blockwise fp16
+            if not os.path.exists(f"{path}/{name}_fp16_blockwise_batching.c"):
                 data_size_blockwise_batching = torch.numel(data_blockwise_batching)
-                data_bf16_blockwise_batching = data_blockwise_batching.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_blockwise_batching = np.char.mod("%#06x", data_bf16_blockwise_batching)
-                data_bf16_blockwise_batching = ", \n".join([", ".join(row) for row in data_bf16_blockwise_batching])
-                c_format_bf16_blockwise_batching = f"""
+                data_fp16_blockwise_batching = data_blockwise_batching.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_blockwise_batching = np.char.mod("%#06x", data_fp16_blockwise_batching)
+                data_fp16_blockwise_batching = ", \n".join([", ".join(row) for row in data_fp16_blockwise_batching])
+                c_format_fp16_blockwise_batching = f"""
 /*
  * Description:         {description}
  * Shape Description:   {shape_description_blockwise_batching}
@@ -211,17 +324,38 @@ unsigned short int {name}_bf16_blockwise_T[{data_size_blockwise_T}] = {{
  * Stride:              {stride_blockwise_batching}
  * Source Code:         {source_code}
  */
-int {name}_bf16_blockwise_batching_shape[6] = {{{", ".join([str(x) for x in data_blockwise_batching.shape])}}};
-unsigned short int {name}_bf16_blockwise_batching[{data_size_blockwise_batching}] = {{
-{data_bf16_blockwise_batching}
+int {name}_fp16_blockwise_batching_shape[6] = {{{", ".join([str(x) for x in data_blockwise_batching.shape])}}};
+unsigned short int {name}_fp16_blockwise_batching[{data_size_blockwise_batching}] = {{
+{data_fp16_blockwise_batching}
 }};
 """
-                with open(f"{path}/{name}_bf16_blockwise_batching.c", "w") as f:
-                    f.write(c_format_bf16_blockwise_batching)
-            # save data to dat file blockwise bf16 bin
-            if not os.path.exists(f"{path}/{name}_bf16_blockwise_batching.dat"):
-                data_bf16_blockwise_batching = data_blockwise_batching.view(-1, 16).to(torch.bfloat16).numpy().view(np.uint16)
-                data_bf16_blockwise_batching.tofile(f"{path}/{name}_bf16_blockwise_batching.dat")
+                with open(f"{path}/{name}_fp16_blockwise_batching.c", "w") as f:
+                    f.write(c_format_fp16_blockwise_batching)
+            # save data to dat file blockwise fp16 bin
+            if not os.path.exists(f"{path}/{name}_fp16_blockwise_batching.dat"):
+                data_fp16_blockwise_batching = data_blockwise_batching.view(-1, 16).to(torch.float16).numpy().view(np.uint16)
+                data_fp16_blockwise_batching.tofile(f"{path}/{name}_fp16_blockwise_batching.dat")
+            # save data to c file blockwise fp32
+#             if not os.path.exists(f"{path}/{name}_fp32_blockwise_batching.c"):
+#                 data_size_blockwise_batching = torch.numel(data_blockwise_batching)
+#                 data_fp32_blockwise_batching = data_blockwise_batching.view(-1, 16).to(torch.float32).numpy().view(np.uint32)
+#                 data_fp32_blockwise_batching = np.char.mod("%#010x", data_fp32_blockwise_batching)
+#                 data_fp32_blockwise_batching = ", \n".join([", ".join(row) for row in data_fp32_blockwise_batching])
+#                 c_format_fp32_blockwise_batching = f"""
+# /*
+#  * Description:         {description}
+#  * Shape Description:   {shape_description_blockwise_batching}
+#  * Shape:               {shape_blockwise_batching}
+#  * Stride:              {stride_blockwise_batching}
+#  * Source Code:         {source_code}
+#  */
+# int {name}_fp32_blockwise_batching_shape[6] = {{{", ".join([str(x) for x in data_blockwise_batching.shape])}}};
+# unsigned int {name}_fp32_blockwise_batching[{data_size_blockwise_batching}] = {{
+# {data_fp32_blockwise_batching}
+# }};
+# """
+#                 with open(f"{path}/{name}_fp32_blockwise_batching.c", "w") as f:
+#                     f.write(c_format_fp32_blockwise_batching)
         return None
 
 
@@ -846,8 +980,8 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, dim = x.shape
-        cuda0 = x.device("cuda:0")
-        cuda1 = torch.device("cuda:0")
+        cuda0 = x.device
+        cuda1 = torch.device("cuda:2")
         x = x.reshape(bsz, seqlen, dim).to(cuda1)
         wq = self.wq.get_master_weight().to(cuda1).T.reshape(1, dim, self.n_local_heads, self.head_dim // 2, 2)
         wq = wq.transpose(3, 4).reshape(dim, self.n_local_heads * self.head_dim).contiguous()
@@ -968,12 +1102,12 @@ class Attention(nn.Module):
                            origin_xq,
                            "bsz, n_heads, seqlen, head_dim",
                            "origin_xq: origin_xq = xq.float()",
-                           "origin_xq: xq=to_bfloat16(xq)")
+                           "origin_xq: xq=to_float16(xq)")
         save_data.add_data(f"activation_ROPE_origin_xk_layer_{layer_num}",
                            origin_xk,
                            "bsz, n_kv_heads, seqlen, head_dim",
                            "origin_xk: origin_xk = xk.float()",
-                           "origin_xk: xk=to_bfloat16(xk)")
+                           "origin_xk: xk=to_float16(xk)")
         save_data.add_data(f"activation_ROPE_rope_xq_layer_{layer_num}",
                            rope_xq,
                            "bsz, n_heads, seqlen, head_dim",
@@ -1149,7 +1283,36 @@ class Attention(nn.Module):
                            "output: output=output@wo")
         return output.to(cuda0)
 
+    def compare_scores_and_values(self, scores: torch.Tensor, values: torch.Tensor):
+        """
+        Compare the scores and values tensors.
 
+        Args:
+            scores (torch.Tensor): Scores tensor.
+            values (torch.Tensor): Values tensor.
+
+        Raises:
+            AssertionError: If the scores and values tensors don't have the same shape.
+        """
+        reference_scores = save_data.get_data_by_name(f"activation_attention_scores_before_mask_layer_{layer_num}").to(
+            scores.device)
+        reference_values = save_data.get_data_by_name(f"activation_attention_values_layer_{layer_num}").to(
+            values.device).transpose(1, 2).contiguous()
+        assert scores.shape == reference_scores.shape
+        assert values.shape == reference_values.shape
+        scores = scores.float()
+        reference_scores = reference_scores.float()
+        values = values.float()
+        reference_values = reference_values.float()
+        # 统计完全不差的有多少
+        scores_diff = torch.abs(scores.view(torch.int32) - reference_scores.view(torch.int32))
+        values_diff = torch.abs(values.view(torch.int32) - reference_values.view(torch.int32))
+        print("scores_number: ", torch.numel(scores_diff), "not_zero_number: ", torch.count_nonzero(scores_diff).item())
+        print("values_number: ", torch.numel(values_diff), "not_zero_number: ", torch.count_nonzero(values_diff).item())
+        # scores = scores.view(-1)
+        # reference_scores = reference_scores.view(-1)
+        # condi = torch.abs(scores - reference_scores) > 1e-2 * torch.abs(reference_scores) + 1e-5
+        # print("unqualified number: ", torch.stack([scores[condi], reference_scores[condi]], dim=1))
 
 
 class FeedForward(nn.Module):
@@ -1443,7 +1606,7 @@ class Transformer(nn.Module):
             ]).type_as(h)
 
         for i in range(10, 20):
-            self.layers[i] = self.layers[i].to(torch.device("cuda:0"))
+            self.layers[i] = self.layers[i].to(torch.device("cuda:3"))
 
         for layer in self.layers:
             if h.device != layer.attention.wq.weight.device:
@@ -1476,7 +1639,7 @@ class Transformer(nn.Module):
                            "output: output=h@output")
 
         print("====================================")
-        print("torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction: ", torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
+        print("torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction: ", torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction)
         print("torch.backends.cuda.matmul.allow_tf32: ", torch.backends.cuda.matmul.allow_tf32)
         print("====================================")
         return output
