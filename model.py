@@ -44,12 +44,13 @@ save_path = "./data_for_z4"
 class SaveData():
     def __init__(self):
         self.description_dict = {}
-        self.data_dict = {}
+        #self.data_dict = {}
         self.shape_dict = {}
         self.shape_description_dict = {}
         self.source_code_dict = {}
         self.stride_dict = {}
         self.name_list = []
+        self.save_path = "./data_for_z4"
 
     def add_data(self, name: str, data: torch.tensor, shape_description: str, source_code: str, description: str):
         if 0 <= layer_num <= 31 and layer_num not in layer_num_need:
@@ -58,29 +59,28 @@ class SaveData():
             name += ("_" + inference_mode)
         if name.startswith("KVCache") and inference_mode == "prefill":
             return None
-        if name in self.data_dict:
+        if name in self.name_list:
             return None
+
         self.name_list.append(name)
-        self.data_dict[name] = data.to("cpu")
+        #self.data_dict[name] = data.to("cpu")
         self.description_dict[name] = description
         self.shape_dict[name] = str(tuple(data.shape))
         self.shape_description_dict[name] = shape_description
         self.source_code_dict[name] = source_code
         self.stride_dict[name] = str(data.stride())
+
         if not data.is_contiguous():
             print("not contiguous: ", name)
             print(shape_description)
             print(tuple(data.shape))
             print(data.stride())
-            self.data_dict[name] = self.data_dict[name].contiguous()
+            data = data.contiguous()
+        
+        self.save_to_c_file(name, data)
         return None
 
-    def get_data_by_name(self, name: str):
-        if not name.startswith("weight"):
-            name += ("_" + inference_mode)
-        return self.data_dict[name]
-
-    def save_to_c_file(self, name: str):
+    def save_to_c_file(self, name: str, data: torch.tensor):
         path = save_path
         if not os.path.exists(path):
             os.makedirs(path)
@@ -89,7 +89,7 @@ class SaveData():
         shape = self.shape_dict[name]
         source_code = self.source_code_dict[name]
         stride = self.stride_dict[name]
-        data = self.data_dict[name]
+        #data = self.data_dict[name]
         data_size = torch.numel(data)
         # special case
         if name.startswith("activation_token_embedding_tokens"):
@@ -115,7 +115,7 @@ unsigned int {name}[{data_size}] = {{
             with open(f"{path}/{name}_uint32.c", "w") as f:
                 f.write(c_format)
             if not os.path.exists(f"{path}/{name}_uint32.dat"):
-                data = self.data_dict[name]
+                #data = self.data_dict[name]
                 data = data.view(-1, 16).numpy().astype(np.uint32)
                 data.tofile(f"{path}/{name}_uint32.dat")
             return None
@@ -846,8 +846,8 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, dim = x.shape
-        cuda0 = x.device
-        cuda1 = torch.device("cuda:2")
+        cuda0 = x.device("cuda:0")
+        cuda1 = torch.device("cuda:0")
         x = x.reshape(bsz, seqlen, dim).to(cuda1)
         wq = self.wq.get_master_weight().to(cuda1).T.reshape(1, dim, self.n_local_heads, self.head_dim // 2, 2)
         wq = wq.transpose(3, 4).reshape(dim, self.n_local_heads * self.head_dim).contiguous()
@@ -1149,36 +1149,7 @@ class Attention(nn.Module):
                            "output: output=output@wo")
         return output.to(cuda0)
 
-    def compare_scores_and_values(self, scores: torch.Tensor, values: torch.Tensor):
-        """
-        Compare the scores and values tensors.
 
-        Args:
-            scores (torch.Tensor): Scores tensor.
-            values (torch.Tensor): Values tensor.
-
-        Raises:
-            AssertionError: If the scores and values tensors don't have the same shape.
-        """
-        reference_scores = save_data.get_data_by_name(f"activation_attention_scores_before_mask_layer_{layer_num}").to(
-            scores.device)
-        reference_values = save_data.get_data_by_name(f"activation_attention_values_layer_{layer_num}").to(
-            values.device).transpose(1, 2).contiguous()
-        assert scores.shape == reference_scores.shape
-        assert values.shape == reference_values.shape
-        scores = scores.float()
-        reference_scores = reference_scores.float()
-        values = values.float()
-        reference_values = reference_values.float()
-        # 统计完全不差的有多少
-        scores_diff = torch.abs(scores.view(torch.int32) - reference_scores.view(torch.int32))
-        values_diff = torch.abs(values.view(torch.int32) - reference_values.view(torch.int32))
-        print("scores_number: ", torch.numel(scores_diff), "not_zero_number: ", torch.count_nonzero(scores_diff).item())
-        print("values_number: ", torch.numel(values_diff), "not_zero_number: ", torch.count_nonzero(values_diff).item())
-        # scores = scores.view(-1)
-        # reference_scores = reference_scores.view(-1)
-        # condi = torch.abs(scores - reference_scores) > 1e-2 * torch.abs(reference_scores) + 1e-5
-        # print("unqualified number: ", torch.stack([scores[condi], reference_scores[condi]], dim=1))
 
 
 class FeedForward(nn.Module):
@@ -1472,7 +1443,7 @@ class Transformer(nn.Module):
             ]).type_as(h)
 
         for i in range(10, 20):
-            self.layers[i] = self.layers[i].to(torch.device("cuda:3"))
+            self.layers[i] = self.layers[i].to(torch.device("cuda:0"))
 
         for layer in self.layers:
             if h.device != layer.attention.wq.weight.device:
